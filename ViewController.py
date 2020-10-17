@@ -7,6 +7,7 @@ import datetime
 import numpy as np
 import pandas as pd
 import sqlite3
+import math
 from StockListManager import StockListManager
 from Database import Database
 
@@ -26,6 +27,9 @@ class ViewController(QMainWindow, form_class):
         with open('parameter.json') as f:
             self.user_param = json.load(f)
 
+        self.slm = StockListManager(self.user_param['path']['root'])
+        self.dateList = self.slm.load_dateList(format='datetime')
+
         self.connect_btn()
         self.symbolList = None
         self.current_page = 0
@@ -34,6 +38,8 @@ class ViewController(QMainWindow, form_class):
         today = datetime.date.today()
         self.dateEdit.setDate(QDate(today.year, today.month, today.day))
         self.current_date = datetime.date(*self.dateEdit.date().getDate())
+        self.didx = len(self.dateList) - 1
+        self.last_date = self.dateList[self.didx]
         self.limit = 100
         self.lineEdit.setText(str(self.limit))
 
@@ -42,8 +48,6 @@ class ViewController(QMainWindow, form_class):
         gs = self.figure.add_gridspec(6, 1)
 
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.mpl_connect('motion_notify_event', self.on_motion)
-        self.canvas.mpl_connect('button_press_event', self.on_click)
         self.ax = [self.figure.add_subplot(gs[:2]),
                    self.figure.add_subplot(gs[2]),
                    self.figure.add_subplot(gs[3:5]),
@@ -55,14 +59,15 @@ class ViewController(QMainWindow, form_class):
         self.gridLayout_2.addWidget(toolbar, 1, 0, 1, 2)
         self.figure.tight_layout()
 
-        self.radioButton.toggled.connect(self.onClicked)
-        self.radioButton_2.toggled.connect(self.onClicked)
-
         self.report = self.xaxis = self.df = self.df_int = self.xtickLabel = self.xaxis_int = self.xtickLabel_int = None
         self.clicked = False
         self.n = 0
         self.num_task = 0
         self.isSet = False
+
+        self.radioButton.toggled.connect(self.onClicked)
+        self.radioButton_2.toggled.connect(self.onClicked)
+        self.lineEdit_2.returnPressed.connect(self.on_returned)
 
         self.type = '돌파'
         self.colors = {'돌파': 'r', '지지': 'g'}
@@ -70,9 +75,8 @@ class ViewController(QMainWindow, form_class):
         self.con = sqlite3.connect(fpath)
 
         fpath = os.path.join(self.user_param['path']['root'], 'database', 'intra_day_3min_{}-{:02d}.db'.format(today.year, today.month))
+        self.db_int = Database(self.user_param['path']['root'], 'intra_day_3min')
         self.con_int = sqlite3.connect(fpath)
-
-        self.slm = StockListManager(self.user_param['path']['root'])
 
     def connect_btn(self):
         btn_map = {self.pushButton: self.go_prev, self.pushButton_2: self.go_next, self.pushButton_3: self.save_task,
@@ -82,24 +86,29 @@ class ViewController(QMainWindow, form_class):
             btn.clicked.connect(func)
 
     def load_task(self):
-        cdate = self.current_date
-        fpath = os.path.join(self.user_param['path']['root'], 'database/screen_tables', 'swing_table_{}.db'.format(cdate.year))
+        self.current_date = datetime.date(*self.dateEdit.date().getDate())
+        fpath = os.path.join(self.user_param['path']['root'], 'database/screen_tables', 'swing_table_{}.db'.format(self.current_date.year))
         con = sqlite3.connect(fpath)
+
+        self.didx = np.where(self.dateList == self.current_date)[0][0]
+        self.last_date = self.dateList[self.didx]
 
         rep_path = os.path.join(self.user_param['path']['root'], 'database/dl_data', self.type, str(self.current_date) + '.xlsx')
 
-        # df = pd.read_sql("SELECT * FROM (SELECT * FROM '{}' ORDER BY PV DESC LIMIT 100)"
-        #                  "".format(cdate), con, index_col='Symbol')
-        df = pd.read_sql("SELECT * FROM '{}'".format(cdate), con, index_col='Symbol')
+        df = pd.read_sql("SELECT * FROM '{}'".format(self.last_date), con, index_col='Symbol')
         self.n = df.shape[0]
         self.symbolList = list(df.index)
         if len(self.symbolList) > 0:
             if os.path.exists(rep_path):
                 self.report = pd.read_excel(rep_path)
-                self.report['code'] = self.report['code'].astype(str).str.zfill(6)
-                self.report = self.report.set_index('code', drop=True)
-                self.num_task = self.report.shape[0]
-                self.current_page = self.report.shape[0]
+                if self.report.empty:
+                    self.report = pd.DataFrame(index=self.symbolList, columns=['date', 'important_price'])
+                    self.report.index.name = 'code'
+                else:
+                    self.report['code'] = self.report['code'].astype(str).str.zfill(6)
+                    self.report = self.report.set_index('code', drop=True)
+                    self.num_task = self.report.shape[0]
+                    self.current_page = self.symbolList.index(self.report.index[-1]) + 1
             else:
                 self.report = pd.DataFrame(index=self.symbolList, columns=['date', 'important_price'])
                 self.report.index.name = 'code'
@@ -107,7 +116,11 @@ class ViewController(QMainWindow, form_class):
             self.show_candle()
         else:
             print('해당 날짜에 해당 주식이 없음')
+
         self.label_2.setText('{} / 100'.format(self.num_task+1))
+        # connect event handler for figures
+        self.canvas.mpl_connect('motion_notify_event', self.on_motion)
+        self.canvas.mpl_connect('button_press_event', self.on_click)
 
     # radio button
     def onClicked(self):
@@ -126,7 +139,20 @@ class ViewController(QMainWindow, form_class):
             self.clicked = True
             self.isSet = True
         else:
+            self.ax[0].clear()
+            self.ax[2].clear()
+            self.report.loc[self.current_code, 'important_price'] = float('nan')
+            self.draw_candle([0, 2])
+
+            self.canvas.draw()
             self.clicked = False
+
+    # for stock name
+    def on_returned(self):
+        self.current_code = self.lineEdit_2.text()
+        idx = self.symbolList.index(self.current_code)
+        self.current_page = idx
+        self.show_candle()
 
     def on_motion(self, event):
         if self.clicked is False and event.inaxes and self.xaxis is not None:
@@ -146,20 +172,22 @@ class ViewController(QMainWindow, form_class):
         rows = range(len(self.ax))
 
         self.df = pd.read_sql("SELECT * FROM (SELECT * FROM '{}' WHERE Date<='{}' ORDER BY Date DESC LIMIT {}) "
-                    "ORDER BY Date".format(self.current_code, self.current_date, self.limit+20), self.con, index_col='Date')
+                    "ORDER BY Date".format(self.current_code, self.last_date, self.limit+20), self.con, index_col='Date')
+        if self.df is None or self.df.empty:
+            return
         self.df['MA_20'] = self.df['Close'].rolling(20).mean()
         self.df.dropna(how='any', inplace=True)
 
-        dateList = self.slm.load_dateList(format='datetime')
-        idx = np.where(dateList == self.current_date)[0][0]
-        pdate = dateList[idx - 1]
-
+        pdate = self.dateList[self.didx-2]
         if Database.checkTableExists(self.con_int, self.current_code):
-            self.df_int = pd.read_sql("SELECT * FROM '{}' WHERE Date BETWEEN '{pdate} 09:00:00' AND '{date} 15:20:00'"
-                                      "".format(self.current_code, pdate=pdate, date=self.current_date), self.con_int, index_col='Date')
-            self.df_int.index = pd.to_datetime(self.df_int.index)
-            self.df_int['MA_20'] = self.df_int['Close'].rolling(20).mean()
-            self.df_int = self.df_int[self.df_int.index.date == self.current_date]
+            try:
+                self.df_int = self.db_int.get_data_by_datetime(self.current_code, pdate, self.last_date, '09:00:00', '15:20:00')
+                if self.df_int is None or self.df_int.empty:
+                    return
+                self.df_int['MA_20'] = self.df_int['Close'].rolling(20).mean()
+                self.df_int = self.df_int[self.df_int.index.date == self.last_date]
+            except Exception as e:
+                print(e)
 
         self.draw_candle(rows)
         self.canvas.draw()
@@ -179,10 +207,15 @@ class ViewController(QMainWindow, form_class):
             self.ax[0].set_ylabel('Price')
 
         if 1 in rows:
+            if self.df is None or self.df.empty:
+                return
             self.ax[1].bar(self.xaxis, self.df['Volume'])
             self.ax[1].set_ylabel('Volume')
 
         if 2 in rows:
+            if self.df_int is None or self.df_int.empty:
+                return
+
             self.xaxis_int = np.arange(self.df_int.shape[0])
             candlestick_ohlc(self.ax[2], zip(self.xaxis_int, self.df_int['Open'], self.df_int['High'], self.df_int['Low'], self.df_int['Close']), width=1, colorup='r', colordown='b')
 
@@ -192,7 +225,7 @@ class ViewController(QMainWindow, form_class):
             self.ax[2].set_xticklabels(self.xtickLabel_int[::4], rotation=30, fontsize=6)
             self.ax[2].set_ylabel('Price')
 
-        if self.current_code in self.report.index and self.report.loc[self.current_code, 'important_price'] != np.nan:
+        if self.current_code in self.report.index and math.isnan(self.report.loc[self.current_code, 'important_price']) is False:
             self.ax[0].plot(self.xaxis, [self.report.loc[self.current_code, 'important_price']] * len(self.xaxis), color=self.colors[self.type])
             self.ax[2].plot(self.xaxis_int, [self.report.loc[self.current_code, 'important_price']] * len(self.xaxis_int), color=self.colors[self.type])
             self.clicked = True
@@ -201,11 +234,11 @@ class ViewController(QMainWindow, form_class):
             self.ax[3].bar(self.xaxis_int, self.df_int['Volume'])
             self.ax[3].set_ylabel('Volume')
 
-        self.label_3.setText('{}'.format(self.current_code))
+        self.lineEdit_2.setText('{}'.format(self.current_code))
         self.figure.tight_layout()
 
     def save_task(self):
-        self.report.to_excel(os.path.join(self.user_param['path']['root'], 'database/dl_data', self.type, str(self.current_date) + '.xlsx'))
+        self.report.dropna(how='any').to_excel(os.path.join(self.user_param['path']['root'], 'database/dl_data', self.type, str(self.current_date) + '.xlsx'))
         if self.isSet:
             self.num_task += 1
 
